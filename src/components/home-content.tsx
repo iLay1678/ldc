@@ -316,17 +316,22 @@ export function HomeContent({ products, announcement, visitorCount, categories: 
                                 <CardFooter className="p-4 pt-0 flex items-center justify-between gap-3 mt-auto border-t border-border/30 bg-muted/5">
                                     <div className="flex flex-col">
                                         <div className="flex items-baseline gap-1.5">
-                                            <span className="text-sm font-semibold text-primary">{Number(product.price)}</span>
-                                            <span className="text-[10px] text-muted-foreground font-medium uppercase">{t('common.credits')}</span>
+                                            <span className="text-lg font-bold text-primary">{Number(product.price)}</span>
+                                            <span className="text-xs text-muted-foreground font-medium uppercase">{t('common.credits')}</span>
                                         </div>
                                         {product.compareAtPrice && Number(product.compareAtPrice) > Number(product.price) && (
-                                            <span className="text-[10px] text-muted-foreground/60 line-through -mt-1 block">
+                                            <span className="text-xs text-muted-foreground/60 line-through -mt-1 block">
                                                 {Number(product.compareAtPrice)}
                                             </span>
                                         )}
-                                        <span className="text-[10px] text-muted-foreground mt-0.5">
-                                            {t('common.stock')}: {product.stockCount}
-                                        </span>
+                                        <div className="flex items-center gap-2 mt-1">
+                                            <span className="text-[10px] text-muted-foreground">
+                                                {t('common.stock')}: {product.stockCount}
+                                            </span>
+                                            <span className="text-[10px] text-muted-foreground">
+                                                {t('common.sold')}: {product.soldCount}
+                                            </span>
+                                        </div>
                                     </div>
 
                                     <Link href={`/buy/${product.id}`}>
