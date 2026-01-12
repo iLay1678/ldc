@@ -15,9 +15,10 @@ interface BuyButtonProps {
     price: string | number
     productName: string
     disabled?: boolean
+    quantity?: number
 }
 
-export function BuyButton({ productId, price, productName, disabled }: BuyButtonProps) {
+export function BuyButton({ productId, price, productName, disabled, quantity = 1 }: BuyButtonProps) {
     const [loading, setLoading] = useState(false)
     const [open, setOpen] = useState(false)
     const [points, setPoints] = useState(0)
@@ -25,7 +26,7 @@ export function BuyButton({ productId, price, productName, disabled }: BuyButton
     const [pointsLoading, setPointsLoading] = useState(false)
     const { t } = useI18n()
 
-    const numericalPrice = Number(price)
+    const numericalPrice = Number(price) * quantity
 
     const handleInitialClick = async () => {
         if (disabled) return
@@ -45,7 +46,7 @@ export function BuyButton({ productId, price, productName, disabled }: BuyButton
     const handleBuy = async () => {
         try {
             setLoading(true)
-            const result = await createOrder(productId, undefined, usePoints)
+            const result = await createOrder(productId, quantity, undefined, usePoints)
 
             if (!result?.success) {
                 const message = result?.error ? t(result.error) : t('common.error')
@@ -111,7 +112,7 @@ export function BuyButton({ productId, price, productName, disabled }: BuyButton
                 <DialogContent>
                     <DialogHeader>
                         <DialogTitle>{t('common.buyNow')}</DialogTitle>
-                        <DialogDescription>{productName}</DialogDescription>
+                        <DialogDescription>{productName} {quantity > 1 ? `x ${quantity}` : ''}</DialogDescription>
                     </DialogHeader>
 
                     <div className="grid gap-4 py-4">

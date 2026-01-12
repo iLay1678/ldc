@@ -8,7 +8,7 @@ import { generateOrderId, generateSign } from "@/lib/crypto"
 import { eq, sql, and, or } from "drizzle-orm"
 import { cookies } from "next/headers"
 
-export async function createOrder(productId: string, email?: string, usePoints: boolean = false) {
+export async function createOrder(productId: string, quantity: number = 1, email?: string, usePoints: boolean = false) {
     const session = await auth()
     const user = session?.user
 
@@ -37,7 +37,7 @@ export async function createOrder(productId: string, email?: string, usePoints: 
 
     // Points Calculation
     let pointsToUse = 0
-    let finalAmount = Number(product.price)
+    let finalAmount = Number(product.price) * quantity
 
     if (usePoints && user?.id) {
         const userRec = await db.query.loginUsers.findFirst({
@@ -59,6 +59,12 @@ export async function createOrder(productId: string, email?: string, usePoints: 
         await db.execute(sql`
             ALTER TABLE cards ADD COLUMN IF NOT EXISTS reserved_order_id TEXT;
             ALTER TABLE cards ADD COLUMN IF NOT EXISTS reserved_at TIMESTAMP;
+        `);
+    }
+
+    const ensureOrdersQuantityColumn = async () => {
+        await db.execute(sql`
+            ALTER TABLE orders ADD COLUMN IF NOT EXISTS quantity INTEGER DEFAULT 1 NOT NULL;
         `);
     }
 
@@ -99,7 +105,8 @@ export async function createOrder(productId: string, email?: string, usePoints: 
         }
     }
 
-    if (stock <= 0) {
+    // Check again if needed
+    if (stock < quantity) {
         try {
             const nullUsed = await db.select({ count: sql<number>`count(*)::int` })
                 .from(cards)
@@ -113,7 +120,7 @@ export async function createOrder(productId: string, email?: string, usePoints: 
         }
     }
 
-    if (stock <= 0) return { success: false, error: 'buy.outOfStock' }
+    if (stock < quantity) return { success: false, error: 'buy.outOfStock' }
 
     // 3. Check Purchase Limit
     if (product.purchaseLimit && product.purchaseLimit > 0) {
@@ -128,18 +135,25 @@ export async function createOrder(productId: string, email?: string, usePoints: 
             if (currentUserEmail) userConditions.push(eq(orders.email, currentUserEmail))
 
             if (userConditions.length > 0) {
-                // For zero price instant delivery, we must count 'delivered' too (already covered)
-                const countResult = await db.select({ count: sql<number>`count(*)::int` })
-                    .from(orders)
-                    .where(and(
-                        eq(orders.productId, productId),
-                        or(...userConditions),
-                        or(eq(orders.status, 'paid'), eq(orders.status, 'delivered'))
-                    ))
+                try {
+                    const countResult = await db.select({
+                        totalQuantity: sql<number>`coalesce(sum(${orders.quantity}), count(*))::int`
+                    })
+                        .from(orders)
+                        .where(and(
+                            eq(orders.productId, productId),
+                            or(...userConditions),
+                            or(eq(orders.status, 'paid'), eq(orders.status, 'delivered'))
+                        ))
 
-                const existingCount = countResult[0]?.count || 0
-                if (existingCount >= product.purchaseLimit) {
-                    return { success: false, error: 'buy.limitExceeded' }
+                    const existingCount = countResult[0]?.totalQuantity || 0
+                    if (existingCount + quantity > product.purchaseLimit) {
+                        return { success: false, error: 'buy.limitExceeded' }
+                    }
+                } catch (e: any) {
+                    // If column missing, try ensuring it (best effort for first run)
+                    await ensureOrdersQuantityColumn()
+                    // Proceeding assuming it's fine or will fail later if critical
                 }
             }
         }
@@ -149,116 +163,111 @@ export async function createOrder(productId: string, email?: string, usePoints: 
     const orderId = generateOrderId()
 
     const reserveAndCreate = async () => {
-        // Import inside function to avoid circular deps if any, though epay/db are safe
         const { queryOrderStatus } = await import("@/lib/epay")
 
-        // 1. Try to find FREE stock first (most efficient)
-        // We do this in a loop to handle the "Expired but actually Paid" case
-        // If we find an expired one that is actually Paid, we fix it and try again.
+        await ensureOrdersQuantityColumn()
 
-        let attempts = 0
-        const maxAttempts = 3 // Don't loop forever
+        const reservedCards: { id: number, key: string }[] = []
 
-        while (attempts < maxAttempts) {
-            attempts++
+        for (let i = 0; i < quantity; i++) {
+            let attempts = 0
+            const maxAttempts = 3
+            let success = false
 
-            // A. Try strictly free card
-            let reservedResult = await db.execute(sql`
-                UPDATE cards
-                SET reserved_order_id = ${orderId}, reserved_at = NOW()
-                WHERE id = (
-                    SELECT id
-                    FROM cards
-                    WHERE product_id = ${productId}
-                      AND COALESCE(is_used, false) = false
-                      AND reserved_at IS NULL
-                    LIMIT 1
-                    FOR UPDATE SKIP LOCKED
-                )
-                RETURNING id, card_key
-            `);
+            while (attempts < maxAttempts && !success) {
+                attempts++
 
-            if (reservedResult.rows.length > 0) {
-                // Found free card!
-                await createOrderRecord(reservedResult, isZeroPrice, pointsToUse, finalAmount, user, email, product, orderId)
-                return
-            }
-
-            // B. If no free card, look for expired ones to "steal" or "fix"
-            const expiredCandidates = await db.execute(sql`
-                SELECT id, reserved_order_id
-                FROM cards
-                WHERE product_id = ${productId}
-                  AND COALESCE(is_used, false) = false
-                  AND reserved_at < NOW() - INTERVAL '5 minutes'
-                LIMIT 1
-                FOR UPDATE SKIP LOCKED
-            `)
-
-            if (expiredCandidates.rows.length === 0) {
-                // No free and no expired => Stock Locked / Out of Stock
-                throw new Error('stock_locked')
-            }
-
-            const candidate = expiredCandidates.rows[0]
-            const candidateCardId = candidate.id
-            const candidateOrderId = candidate.reserved_order_id as string
-
-            // Verify the candidate order status
-            let isPaid = false
-            try {
-                if (candidateOrderId) {
-                    const statusRes = await queryOrderStatus(candidateOrderId)
-                    if (statusRes.success && statusRes.status === 1) {
-                        isPaid = true
-                    }
-                }
-            } catch (e) {
-                console.error("Failed to verify candidate order", e)
-                // If verify fails, conservative approach: don't steal.
-                // But if we don't steal, we might block forever.
-                // Let's assume if query fails, we skip this one? Or treat as unpaid? 
-                // Treat as unpaid to avoid indefinite lock? Or treat as paid to be safe?
-                // Safe: treat as paid (don't steal).
-                // But then we might fail order creation. 
-                // Let's treat as 'skip' aka 'continue loop' without fixing?
-                // Actually, if we can't verify, we probably shouldn't steal.
-                continue
-            }
-
-            if (isPaid) {
-                // It was paid! Fix the data.
-                await db.execute(sql`
-                    UPDATE cards SET is_used = true, used_at = NOW() WHERE id = ${candidateCardId};
-                    UPDATE orders SET status = 'paid', paid_at = NOW() WHERE order_id = ${candidateOrderId} AND status = 'pending';
-                `)
-                // Continue loop to find next available card
-                continue
-            } else {
-                // It is NOT paid (or cancelled/refunded/pending-timeout). Steal it!
-                reservedResult = await db.execute(sql`
+                // A. Try strictly free card
+                let reservedResult = await db.execute(sql`
                     UPDATE cards
                     SET reserved_order_id = ${orderId}, reserved_at = NOW()
-                    WHERE id = ${candidateCardId}
+                    WHERE id = (
+                        SELECT id
+                        FROM cards
+                        WHERE product_id = ${productId}
+                        AND COALESCE(is_used, false) = false
+                        AND reserved_at IS NULL
+                        LIMIT 1
+                        FOR UPDATE SKIP LOCKED
+                    )
                     RETURNING id, card_key
-                `)
+                `);
 
                 if (reservedResult.rows.length > 0) {
-                    await createOrderRecord(reservedResult, isZeroPrice, pointsToUse, finalAmount, user, email, product, orderId)
-                    return
+                    reservedCards.push({
+                        id: reservedResult.rows[0].id as number,
+                        key: reservedResult.rows[0].card_key as string
+                    })
+                    success = true
+                    continue // Break inner while, continue for loop
                 }
-                // If update failed (race?), continue loop
-            }
-        }
 
-        throw new Error('stock_locked')
+                // B. Fallback: Expired
+                const expiredCandidates = await db.execute(sql`
+                    SELECT id, reserved_order_id
+                    FROM cards
+                    WHERE product_id = ${productId}
+                    AND COALESCE(is_used, false) = false
+                    AND reserved_at < NOW() - INTERVAL '5 minutes'
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                `)
+
+                if (expiredCandidates.rows.length === 0) {
+                    // No candidates found this attempt
+                    break // Break inner while, likely will throw stock_locked if loop finishes
+                }
+
+                const candidate = expiredCandidates.rows[0]
+                const candidateCardId = candidate.id
+                const candidateOrderId = candidate.reserved_order_id as string
+
+                let isPaid = false
+                try {
+                    if (candidateOrderId) {
+                        const statusRes = await queryOrderStatus(candidateOrderId)
+                        if (statusRes.success && statusRes.status === 1) {
+                            isPaid = true
+                        }
+                    }
+                } catch {
+                    // ignore verification error, skip
+                }
+
+                if (isPaid) {
+                    await db.execute(sql`
+                        UPDATE cards SET is_used = true, used_at = NOW() WHERE id = ${candidateCardId};
+                        UPDATE orders SET status = 'paid', paid_at = NOW() WHERE order_id = ${candidateOrderId} AND status = 'pending';
+                    `)
+                    continue // Retry this attempt (find another card)
+                } else {
+                    reservedResult = await db.execute(sql`
+                        UPDATE cards
+                        SET reserved_order_id = ${orderId}, reserved_at = NOW()
+                        WHERE id = ${candidateCardId}
+                        RETURNING id, card_key
+                    `)
+                    if (reservedResult.rows.length > 0) {
+                        reservedCards.push({
+                            id: reservedResult.rows[0].id as number,
+                            key: reservedResult.rows[0].card_key as string
+                        })
+                        success = true
+                    }
+                }
+            } // end while
+
+            if (!success) {
+                throw new Error('stock_locked')
+            }
+        } // end for
+
+        const joinedKeys = reservedCards.map(c => c.key).join('\n')
+
+        await createOrderRecord(reservedCards, joinedKeys, isZeroPrice, pointsToUse, finalAmount, user, session?.user?.name, email, product, orderId, quantity)
     };
 
-    const createOrderRecord = async (reservedResult: any, isZeroPrice: boolean, pointsToUse: number, finalAmount: number, user: any, email: any, product: any, orderId: string) => {
-        const cardKey = reservedResult.rows[0].card_key as string;
-        const cardId = reservedResult.rows[0].id as number;
-
-        // ... Verify points again if needed inside tx (already checked in outer logic? No, need to do it here)
+    const createOrderRecord = async (reservedCards: any[], joinedKeys: string, isZeroPrice: boolean, pointsToUse: number, finalAmount: number, user: any, username: any, email: any, product: any, orderId: string, qty: number) => {
         if (pointsToUse > 0) {
             const updatedUser = await db.update(loginUsers)
                 .set({ points: sql`${loginUsers.points} - ${pointsToUse}` })
@@ -270,33 +279,21 @@ export async function createOrder(productId: string, email?: string, usePoints: 
             }
         }
 
-        // If Zero Price: Mark card used and order delivered immediately
         if (isZeroPrice) {
-            await db.update(cards).set({
-                isUsed: true,
-                usedAt: new Date(),
-                reservedOrderId: null,
-                reservedAt: null
-            }).where(eq(cards.id, cardId));
+            const cardIds = reservedCards.map(c => c.id)
+            if (cardIds.length > 0) {
+                // Using loop for update to be safe with SQL template array syntax dependent on adapter
+                // Or simple:
+                for (const cid of cardIds) {
+                    await db.update(cards).set({
+                        isUsed: true,
+                        usedAt: new Date(),
+                        reservedOrderId: null,
+                        reservedAt: null
+                    }).where(eq(cards.id, cid));
+                }
+            }
 
-            await db.insert(orders).values({
-                orderId,
-                productId: product.id,
-                productName: product.name,
-                amount: finalAmount.toString(), // 0.00
-                email: email || user?.email || null,
-                userId: user?.id || null,
-                username: user?.username || null,
-                status: 'delivered',
-                cardKey: cardKey,
-                paidAt: new Date(),
-                deliveredAt: new Date(),
-                tradeNo: 'POINTS_REDEMPTION',
-                pointsUsed: pointsToUse
-            });
-
-        } else {
-            // Normal Pending Order
             await db.insert(orders).values({
                 orderId,
                 productId: product.id,
@@ -304,10 +301,29 @@ export async function createOrder(productId: string, email?: string, usePoints: 
                 amount: finalAmount.toString(),
                 email: email || user?.email || null,
                 userId: user?.id || null,
-                username: user?.username || null,
+                username: username || user?.username || null,
+                status: 'delivered',
+                cardKey: joinedKeys,
+                paidAt: new Date(),
+                deliveredAt: new Date(),
+                tradeNo: 'POINTS_REDEMPTION',
+                pointsUsed: pointsToUse,
+                quantity: qty
+            });
+
+        } else {
+            await db.insert(orders).values({
+                orderId,
+                productId: product.id,
+                productName: product.name,
+                amount: finalAmount.toString(),
+                email: email || user?.email || null,
+                userId: user?.id || null,
+                username: username || user?.username || null,
                 status: 'pending',
                 pointsUsed: pointsToUse,
-                currentPaymentId: orderId
+                currentPaymentId: orderId,
+                quantity: qty
             });
         }
     }
@@ -322,7 +338,6 @@ export async function createOrder(productId: string, email?: string, usePoints: 
             return { success: false, error: 'Points mismatch, please try again.' };
         }
 
-        // Schema retry logic 
         const errorString = JSON.stringify(error);
         const isMissingColumn =
             error?.message?.includes('reserved_order_id') ||
@@ -330,11 +345,7 @@ export async function createOrder(productId: string, email?: string, usePoints: 
             errorString.includes('42703');
 
         if (isMissingColumn) {
-            await db.execute(sql`
-                ALTER TABLE cards ADD COLUMN IF NOT EXISTS reserved_order_id TEXT;
-                ALTER TABLE cards ADD COLUMN IF NOT EXISTS reserved_at TIMESTAMP;
-            `);
-
+            await ensureCardsReservationColumns()
             try {
                 await reserveAndCreate();
             } catch (retryError: any) {
@@ -347,7 +358,6 @@ export async function createOrder(productId: string, email?: string, usePoints: 
         }
     }
 
-    // If Zero Price, return Success (redirect to order view)
     if (isZeroPrice) {
         return {
             success: true,
@@ -356,11 +366,9 @@ export async function createOrder(productId: string, email?: string, usePoints: 
         }
     }
 
-    // Set Pending Cookie
     const cookieStore = await cookies()
     cookieStore.set('ldc_pending_order', orderId, { secure: true, path: '/', sameSite: 'lax' })
 
-    // 4. Generate Pay Params
     const baseUrl = process.env.NEXT_PUBLIC_APP_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'http://localhost:3000');
     const payParams: Record<string, any> = {
         pid: process.env.MERCHANT_ID!,
@@ -393,16 +401,12 @@ export async function getRetryPaymentParams(orderId: string) {
     })
 
     if (!order) return { success: false, error: 'buy.productNotFound' }
-    if (order.status !== 'pending') return { success: false, error: 'order.status.paid' } // Or just generic error
+    if (order.status !== 'pending') return { success: false, error: 'order.status.paid' }
 
-    // Generate Pay Params
     const baseUrl = process.env.NEXT_PUBLIC_APP_URL || (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : 'http://localhost:3000');
 
-    // Fix: EPay requires unique out_trade_no for every request.
-    // We append a timestamp suffix for retries, and strip it in the notify handler.
     const uniqueTradeNo = `${order.orderId}_retry${Date.now()}`;
 
-    // Update current_payment_id in DB so active query checks this one
     await db.update(orders)
         .set({ currentPaymentId: uniqueTradeNo })
         .where(eq(orders.orderId, orderId))

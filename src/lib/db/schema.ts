@@ -45,6 +45,7 @@ export const orders = pgTable('orders', {
     username: text('username'),
     payee: text('payee'),
     pointsUsed: integer('points_used').default(0),
+    quantity: integer('quantity').default(1).notNull(),
     currentPaymentId: text('current_payment_id'),
     createdAt: timestamp('created_at').defaultNow(),
 });

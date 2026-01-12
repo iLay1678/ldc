@@ -67,6 +67,7 @@ export function BuyContent({
 }: BuyContentProps) {
     const { t } = useI18n()
     const [shareUrl, setShareUrl] = useState('')
+    const [quantity, setQuantity] = useState(1)
 
     useEffect(() => {
         if (typeof window !== 'undefined') {
@@ -188,11 +189,44 @@ export function BuyContent({
                             <div className="flex-1">
                                 {isLoggedIn ? (
                                     stockCount > 0 ? (
-                                        <div className="w-full sm:w-auto">
+                                        <div className="flex flex-col gap-4 w-full sm:w-auto">
+                                            <div className="flex items-center gap-3">
+                                                <div className="flex items-center border border-border rounded-md">
+                                                    <Button
+                                                        variant="ghost"
+                                                        size="icon"
+                                                        className="h-8 w-8 rounded-none border-r border-border"
+                                                        onClick={() => setQuantity(Math.max(1, quantity - 1))}
+                                                        disabled={quantity <= 1}
+                                                    >
+                                                        -
+                                                    </Button>
+                                                    <div className="w-12 text-center text-sm font-medium">
+                                                        {quantity}
+                                                    </div>
+                                                    <Button
+                                                        variant="ghost"
+                                                        size="icon"
+                                                        className="h-8 w-8 rounded-none border-l border-border"
+                                                        onClick={() => {
+                                                            const limit = product.purchaseLimit && product.purchaseLimit > 0 ? product.purchaseLimit : 999
+                                                            const max = Math.min(stockCount, limit)
+                                                            setQuantity(Math.min(max, quantity + 1))
+                                                        }}
+                                                        disabled={quantity >= Math.min(stockCount, (product.purchaseLimit && product.purchaseLimit > 0 ? product.purchaseLimit : 999))}
+                                                    >
+                                                        +
+                                                    </Button>
+                                                </div>
+                                                <div className="text-sm font-medium text-muted-foreground">
+                                                    {t('buy.modal.total')}: <span className="text-primary font-bold">{(Number(product.price) * quantity).toFixed(2)}</span>
+                                                </div>
+                                            </div>
                                             <BuyButton
                                                 productId={product.id}
                                                 price={product.price}
                                                 productName={product.name}
+                                                quantity={quantity}
                                             />
                                         </div>
                                     ) : (
