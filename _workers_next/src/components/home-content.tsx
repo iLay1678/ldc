@@ -183,24 +183,11 @@ export function HomeContent({ products, announcement, visitorCount, categories =
                     <div className="flex flex-col gap-4">
                         <div className="rounded-[1.7rem] border border-border/45 bg-background/76 p-5 shadow-sm backdrop-blur-xl">
                             <div className="mb-4 flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
-                                <Search className="h-4 w-4" />
-                                <span>{t("home.heroSearchHint")}</span>
+                                <Layers3 className="h-4 w-4" />
+                                <span>{t("home.heroCategoryLead")}</span>
                             </div>
                             <div className="space-y-3">
-                                <div className="relative">
-                                    <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-                                    <Input
-                                        placeholder={t("common.searchPlaceholder")}
-                                        value={searchTerm}
-                                        onChange={(e) => setSearchTerm(e.target.value)}
-                                        className="h-11 rounded-2xl border-border/50 bg-background/90 pl-10 shadow-none transition-colors focus:border-primary/50"
-                                    />
-                                </div>
                                 <div className="rounded-[1.4rem] border border-border/45 bg-muted/25 p-4">
-                                    <div className="mb-3 flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.16em] text-muted-foreground">
-                                        <Layers3 className="h-4 w-4" />
-                                        <span>{t("home.heroCategoryLead")}</span>
-                                    </div>
                                     <div className="flex flex-wrap gap-2">
                                         {highlightedCategories.length > 0 ? (
                                             highlightedCategories.map((category) => {
@@ -224,6 +211,14 @@ export function HomeContent({ products, announcement, visitorCount, categories =
                                         ) : (
                                             <span className="text-sm text-muted-foreground">{t("home.noProducts")}</span>
                                         )}
+                                    </div>
+                                </div>
+                                <div className="rounded-[1.4rem] border border-border/45 bg-background/80 px-4 py-3">
+                                    <div className="text-xs font-semibold uppercase tracking-[0.16em] text-muted-foreground">
+                                        {t("home.catalogEyebrow")}
+                                    </div>
+                                    <div className="mt-2 text-sm leading-6 text-muted-foreground">
+                                        {t("home.catalogSubtitle")}
                                     </div>
                                 </div>
                             </div>
